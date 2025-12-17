@@ -65,7 +65,7 @@ Outputs: `separated_0.wav`, `separated_1.wav`.
 - Venkatesan Govindarajan
 
 ## License
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the unlicense - see the LICENSE file for details.
 
 ## Improvements and Collaboration
 For improvements, contributions, or collaboration on the implementation, please contact:
