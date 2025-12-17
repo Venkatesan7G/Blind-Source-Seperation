@@ -10,9 +10,7 @@ import time
 import numpy as np
 import torch
 import torchaudio
-
-# Force soundfile backend to fix TorchCodec/FFmpeg DLL error on Windows
-torchaudio.set_audio_backend("soundfile")
+import soundfile as sf  # Use for loading/saving to bypass TorchCodec issues
 
 import scipy.signal
 import joblib
@@ -45,7 +43,7 @@ def unmixing(coeffs, X, chanout, maxdelay=20):
     delay = np.abs(np.reshape(coeffs[chanin * chanout:], (chanin, chanout)))
     att = np.clip(att, -1.5, 1.5)
     delay = np.clip(delay, 0, maxdelay)
-    Y = np.zeros_like(X[:, :, np.newaxis]) * chanout  # (samples, chanin, chanout)
+    Y = np.zeros((X.shape[0], chanin, chanout))  # Fixed shape: (samples, chanin, chanout)
     for fromchan in range(chanin):
         for tochan in range(chanout):
             a, b = allp_delayfilt(delay[fromchan, tochan], maxdelay)
@@ -102,11 +100,10 @@ def hybrid_bss(mixture_path, bss_model, n_src=2, target_sr=8000, blend_weight=0.
     4. Blend mono mix with downmixed initials (intelligent input enhancement).
     5. Feed to pretrained BSS model for refinement.
     """
-    # Load and preprocess
-    audio, sr = torchaudio.load(mixture_path)
-    if audio.shape[0] == 1:  # If mono, duplicate for stereo processing
-        audio = audio.repeat(2, 1)
-    audio_np = audio.numpy().T  # (samples, channels=2)
+    # Load and preprocess with soundfile
+    audio_np, sr = sf.read(mixture_path)  # (samples, channels) or (samples,)
+    if audio_np.ndim == 1:
+        audio_np = np.stack([audio_np, audio_np], axis=1)  # Duplicate mono to stereo
     audio_np = quantize_dither(audio_np)
 
     # Random Directions for priors (initial sep)
@@ -117,9 +114,10 @@ def hybrid_bss(mixture_path, bss_model, n_src=2, target_sr=8000, blend_weight=0.
     initial_sep = unmixing(coeffs_min, audio_np, chanout)  # (samples, n_src)
 
     # Downmix/resample original to mono 8kHz
-    mono_mix = audio.mean(dim=0).unsqueeze(0)  # (1, T)
+    mono_mix = audio_np.mean(axis=1)  # (samples,)
+    mono_mix_t = torch.from_numpy(mono_mix).float().unsqueeze(0)  # (1, T)
     resampler = torchaudio.transforms.Resample(sr, target_sr)
-    mono_mix = resampler(mono_mix).squeeze().numpy()
+    mono_mix = resampler(mono_mix_t).squeeze().numpy()
 
     # Resample/blend initials with mix (weighted priors)
     initial_sep_t = torch.from_numpy(initial_sep.T).float().unsqueeze(0)  # (1, n_src, T)
@@ -135,17 +133,18 @@ def hybrid_bss(mixture_path, bss_model, n_src=2, target_sr=8000, blend_weight=0.
         refined_sources = []
         for enhanced in enhanced_inputs:
             sep = bss_model(enhanced)  # (1, n_src, T); take first as refinement
-            refined_sources.append(sep[0, 0].cpu())  # Simplify: Take primary sep per input
+            refined_sources.append(sep[0, 0].cpu().numpy())  # To numpy for sf.write
+
     proc_time = time.time() - start
 
-    # Save (stack if needed; here save per source)
+    # Save with soundfile (avoid torchaudio.save)
     for i, sep in enumerate(refined_sources):
-        torchaudio.save(f"separated_{i}.wav", sep.unsqueeze(0), target_sr)
+        sf.write(f"separated_{i}.wav", sep, target_sr)
 
     print(f"Hybrid BSS complete. Time: {proc_time:.3f}s")
 
 if __name__ == "__main__":
-    mixture_path = "speech_recordings/speechcn.wav"
+    mixture_path = "speech_recordings/output_010.wav"
     # Load pretrained ConvTasNet (example model)
     model = ConvTasNet.from_pretrained("mpariente/ConvTasNet_WHAM_sepclean")
     model.eval()
