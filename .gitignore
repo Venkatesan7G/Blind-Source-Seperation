@@ -1,14 +1,7 @@
-# Ignore Python bytecode files
-__pycache__/
+dataset
+separated
+splits
+stft_data
+cheeckpoints
+*.wav
 
-# Ignore Jupyter notebook files
-*.ipynb
-
-# Ignore generated dataset directory
-generated_dataset/
-
-# Ignore Keras model file
-best_model.keras
-
-# Ignore STFT data directory
-stft_data/

@@ -1,171 +1,164 @@
-import pyroomacoustics as pra
 import numpy as np
-import random
+import pyroomacoustics as pra
 import warnings
 
-def custom_generate_room_mix(speech_audio, noise_audio, sr=16000,
-                           room_dim_range=((5.0, 5.0, 2.5), (10.0, 10.0, 3.5)),
-                           mic_dist_min=2.0, src_dist_min=1.0,
-                           rt60_range=(0.1, 0.5), plot=False):
+
+def _rand_pos_in_room(room_dim: np.ndarray, buffer_m: float, rng: np.random.Generator) -> np.ndarray:
+    return np.array([rng.uniform(buffer_m, d - buffer_m) for d in room_dim], dtype=np.float32)
+
+
+def _try_make_room(
+    sr: int,
+    room_dim_range,
+    rt60_range,
+    rng: np.random.Generator,
+    max_attempts: int = 200,
+):
     """
-    Generates a room acoustic mix with two microphones and two sources (speech, noise).
-
-    Args:
-        speech_audio (np.ndarray): NumPy array of speech audio samples.
-        noise_audio (np.ndarray): NumPy array of noise audio samples.
-        sr (int): Sampling rate.
-        room_dim_range (tuple): Tuple of (min_dims, max_dims) for room dimensions (x, y, z).
-        mic_dist_min (float): Minimum distance between microphones in meters.
-        src_dist_min (float): Minimum distance between sources in meters.
-        rt60_range (tuple): Tuple of (min_rt60, max_rt60) for room reverberation time.
-        plot (bool): If True, plots the room setup.
-
-    Returns:
-        tuple: (mixed_audio, clean_speech_mic1, clean_speech_mic2,
-                clean_noise_mic1, clean_noise_mic2) as numpy arrays.
+    Try sampling (room_dim, rt60) until pra.inverse_sabine succeeds and returns valid absorption.
+    Returns: (room, room_dim, rt60, e_abs)
     """
+    min_dim = np.array(room_dim_range[0], dtype=np.float32)
+    max_dim = np.array(room_dim_range[1], dtype=np.float32)
 
-    # 1. Randomly select room dimensions and RT60 with retry for valid absorption coefficient
-    max_room_param_attempts = 100
-    room = None
-    for _ in range(max_room_param_attempts):
-        min_dims, max_dims = room_dim_range
-        room_dim = np.array([
-            random.uniform(min_dims[0], max_dims[0]),
-            random.uniform(min_dims[1], max_dims[1]),
-            random.uniform(min_dims[2], max_dims[2]),
-        ])
-        rt60 = random.uniform(rt60_range[0], rt60_range[1])
+    for _ in range(max_attempts):
+        room_dim = rng.uniform(min_dim, max_dim).astype(np.float32)
+        rt60 = float(rng.uniform(rt60_range[0], rt60_range[1]))
 
         try:
-            e_absorption_raw = pra.inverse_sabine(rt60, room_dim)
-            if isinstance(e_absorption_raw, tuple):
-                e_absorption = e_absorption_raw[0]
-            else:
-                e_absorption = e_absorption_raw
+            e_abs_raw = pra.inverse_sabine(rt60, room_dim)
+            e_abs = e_abs_raw[0] if isinstance(e_abs_raw, tuple) else e_abs_raw
+            e_abs = float(e_abs)
 
-            # Ensure absorption coefficient is within valid range [0, 1) after extraction
-            if 0 < e_absorption < 1:
-                room = pra.ShoeBox(room_dim, fs=sr, materials=pra.Material(e_absorption))
-                break # Valid room created, exit retry loop
-            else:
-                warnings.warn(f"Generated e_absorption {e_absorption:.2f} out of [0, 1) range. Retrying.")
-        except ValueError as e:
-            warnings.warn(f"ValueError during room parameter generation: {e}. Retrying.")
+            # must be in (0,1)
+            if not (0.0 < e_abs < 1.0):
+                continue
 
-    if room is None:
-        raise RuntimeError("Failed to create a valid room with acceptable parameters after multiple attempts.")
+            room = pra.ShoeBox(room_dim, fs=sr, materials=pra.Material(e_abs))
+            return room, room_dim, rt60, e_abs
 
-    # Define buffer distance from walls for microphone and source placement
-    wall_buffer = 0.5 # meters
+        except ValueError:
+            # This is the exact error you saw. Just retry.
+            continue
 
-    def get_random_pos_in_room(dims, buffer):
-        return np.array([random.uniform(buffer, d - buffer) for d in dims])
-
-    # 2. Microphone Placement (at least mic_dist_min apart)
-    max_mic_placement_attempts = 100
-    mic1_pos = get_random_pos_in_room(room_dim, wall_buffer)
-    mic2_pos = None
-
-    for _ in range(max_mic_placement_attempts):
-        temp_mic2_pos = get_random_pos_in_room(room_dim, wall_buffer)
-        if np.linalg.norm(mic1_pos - temp_mic2_pos) >= mic_dist_min:
-            mic2_pos = temp_mic2_pos
-            break
-
-    if mic2_pos is None:
-        warnings.warn("Could not place second microphone meeting distance criteria after multiple attempts. "
-                      "Consider adjusting mic_dist_min or room_dim_range.")
-        mic2_pos = mic1_pos + np.array([mic_dist_min, 0, 0]) # Fallback: try to place it along x-axis
-        # Ensure fallback position is within room, if not, choose random without min_dist
-        if not all(wall_buffer <= c <= d - wall_buffer for c, d in zip(mic2_pos, room_dim)):
-            mic2_pos = get_random_pos_in_room(room_dim, wall_buffer)
-
-    mic_positions = np.c_[mic1_pos, mic2_pos]
-    room.add_microphone_array(pra.MicrophoneArray(mic_positions, fs=sr))
-
-    # 3. Source Placement (at least src_dist_min apart from each other, buffered from mics)
-    max_src_placement_attempts = 100
-    src_buffer_from_mic = 0.3 # Ensure sources are not too close to microphones
-
-    speech_src_pos = get_random_pos_in_room(room_dim, wall_buffer)
-    noise_src_pos = None
-
-    mic_positions_list = [mic1_pos, mic2_pos]
-
-    for _ in range(max_src_placement_attempts):
-        temp_noise_src_pos = get_random_pos_in_room(room_dim, wall_buffer)
-        dist_to_speech = np.linalg.norm(speech_src_pos - temp_noise_src_pos)
-        dist_to_mics_ok = True
-        for mic_p in mic_positions_list:
-            if np.linalg.norm(mic_p - temp_noise_src_pos) < src_buffer_from_mic:
-                dist_to_mics_ok = False
-                break
-
-        if dist_to_speech >= src_dist_min and dist_to_mics_ok:
-            noise_src_pos = temp_noise_src_pos
-            break
-
-    if noise_src_pos is None:
-        warnings.warn("Could not place second source meeting distance criteria from speech source/mics after multiple attempts. "
-                      "Consider adjusting src_dist_min or room_dim_range.")
-        noise_src_pos = get_random_pos_in_room(room_dim, wall_buffer)
-
-
-    # Add sources to the room (signals are stored in source objects)
-    _ = room.add_source(speech_src_pos, signal=speech_audio)
-    _ = room.add_source(noise_src_pos, signal=noise_audio)
-
-    # Compute RIRs for all sources and microphones
-    room.compute_rir()
-
-    # Get RIRs for each source-microphone pair from room.rir
-    # room.rir has shape (n_mics, n_sources, rir_length)
-    # Assuming speech is source 0 and noise is source 1
-    speech_rir_mic1 = room.rir[0][0]
-    speech_rir_mic2 = room.rir[1][0]
-    noise_rir_mic1 = room.rir[0][1]
-    noise_rir_mic2 = room.rir[1][1]
-
-    # Convolve source signals with their respective RIRs to get clean signals at each microphone
-    clean_speech_mic1_full = np.convolve(speech_audio, speech_rir_mic1)
-    clean_speech_mic2_full = np.convolve(speech_audio, speech_rir_mic2)
-    clean_noise_mic1_full = np.convolve(noise_audio, noise_rir_mic1)
-    clean_noise_mic2_full = np.convolve(noise_audio, noise_rir_mic2)
-
-    # Determine the minimum length across all full convolved signals
-    min_overall_len = min(
-        len(clean_speech_mic1_full), len(clean_speech_mic2_full),
-        len(clean_noise_mic1_full), len(clean_noise_mic2_full)
+    raise RuntimeError(
+        f"Failed to create valid room after {max_attempts} attempts. "
+        f"Try narrowing rt60_range or room_dim_range."
     )
 
-    # Truncate all clean signals to the minimum common length
-    clean_speech_mic1 = clean_speech_mic1_full[:min_overall_len]
-    clean_speech_mic2 = clean_speech_mic2_full[:min_overall_len]
-    clean_noise_mic1 = clean_noise_mic1_full[:min_overall_len]
-    clean_noise_mic2 = clean_noise_mic2_full[:min_overall_len]
 
-    # Manually create mixed audio by summing the truncated clean signals
-    mixed_audio_mic1 = clean_speech_mic1 + clean_noise_mic1
-    mixed_audio_mic2 = clean_speech_mic2 + clean_noise_mic2
-    mixed_audio = np.c_[mixed_audio_mic1, mixed_audio_mic2] # Shape (n_samples, n_mics)
+def _convolve(signal: np.ndarray, rir: np.ndarray) -> np.ndarray:
+    return np.convolve(signal, rir).astype(np.float32)
 
-    # Simulate the room if plotting is requested to prepare for plotting (e.g. `room.plot()`)
-    # Note: `room.simulate()` populates `room.mic_array.signals` which is what `room.plot()` expects.
-    # If we manually calculate mixed_audio, `room.mic_array.signals` might be empty or incorrect for plotting.
-    # For plotting only, we might need to call room.simulate() to fill the signals.
-    # However, if we are returning mixed_audio from manual convolution, the `room.simulate()` here
-    # will just generate new signals and is not used for return values.
-    if plot:
-        # Re-run simulation to populate mic_array.signals for plotting. This is slightly redundant
-        # if we calculated signals manually, but needed for the plot function's internal logic.
-        room.simulate()
-        import matplotlib.pyplot as plt
-        fig, ax = room.plot()
-        ax.set_xlim([0, room_dim[0]])
-        ax.set_ylim([0, room_dim[1]])
-        ax.set_zlim([0, room_dim[2]])
-        plt.title(f'Room Setup (RT60: {rt60:.2f}s)')
-        plt.show()
 
-    return mixed_audio, clean_speech_mic1, clean_speech_mic2, clean_noise_mic1, clean_noise_mic2
+def generate_stereo_bss_mix(
+    s1_dry: np.ndarray,
+    s2_dry: np.ndarray,
+    sr: int = 16000,
+    room_dim_range=((5.0, 5.0, 2.5), (10.0, 10.0, 3.5)),
+    rt60_range=(0.1, 0.6),
+    mic_spacing_range=(0.08, 0.30),
+    wall_buffer=0.5,
+    min_src_dist=1.0,
+    target_snr_db_range=(-5.0, 10.0),
+    seed: int | None = None,
+):
+    """
+    Returns:
+      mix_stereo: (N, 2)
+      s1_stereo:  (N, 2)  source-1 image at both mics
+      s2_stereo:  (N, 2)  source-2 image at both mics
+      meta: dict with room+placement+snr
+    """
+    rng = np.random.default_rng(seed)
+
+    # 1) Robust room creation (retries until inverse_sabine is valid)
+    room, room_dim, rt60, e_abs = _try_make_room(
+        sr=sr,
+        room_dim_range=room_dim_range,
+        rt60_range=rt60_range,
+        rng=rng,
+        max_attempts=300,
+    )
+
+    # 2) Mic positions (2-mic linear array)
+    mic_center = _rand_pos_in_room(room_dim, wall_buffer, rng)
+    spacing = float(rng.uniform(mic_spacing_range[0], mic_spacing_range[1]))
+
+    mic1 = mic_center.copy()
+    mic2 = mic_center.copy()
+    mic2[0] = np.clip(mic1[0] + spacing, wall_buffer, room_dim[0] - wall_buffer)
+
+    room.add_microphone_array(pra.MicrophoneArray(np.c_[mic1, mic2], fs=sr))
+
+    # 3) Source positions (keep distance)
+    src1 = _rand_pos_in_room(room_dim, wall_buffer, rng)
+    src2 = _rand_pos_in_room(room_dim, wall_buffer, rng)
+    tries = 0
+    while np.linalg.norm(src1 - src2) < min_src_dist and tries < 80:
+        src2 = _rand_pos_in_room(room_dim, wall_buffer, rng)
+        tries += 1
+    if tries >= 80:
+        warnings.warn("Could not enforce min_src_dist; continuing anyway.")
+
+    # Add sources only to compute RIRs
+    room.add_source(src1, signal=None)
+    room.add_source(src2, signal=None)
+    room.compute_rir()
+
+    rir_m1_s1 = np.array(room.rir[0][0], dtype=np.float32)
+    rir_m2_s1 = np.array(room.rir[1][0], dtype=np.float32)
+    rir_m1_s2 = np.array(room.rir[0][1], dtype=np.float32)
+    rir_m2_s2 = np.array(room.rir[1][1], dtype=np.float32)
+
+    # 4) Convolve dry sources -> source images at mics
+    s1_m1 = _convolve(s1_dry, rir_m1_s1)
+    s1_m2 = _convolve(s1_dry, rir_m2_s1)
+    s2_m1 = _convolve(s2_dry, rir_m1_s2)
+    s2_m2 = _convolve(s2_dry, rir_m2_s2)
+
+    # 5) Match length
+    N = min(len(s1_m1), len(s1_m2), len(s2_m1), len(s2_m2))
+    s1_m1, s1_m2, s2_m1, s2_m2 = s1_m1[:N], s1_m2[:N], s2_m1[:N], s2_m2[:N]
+
+    # 6) Enforce target SNR at mic1
+    target_snr_db = float(rng.uniform(target_snr_db_range[0], target_snr_db_range[1]))
+
+    p1 = float(np.mean(s1_m1**2) + 1e-12)
+    p2 = float(np.mean(s2_m1**2) + 1e-12)
+    gain = np.sqrt(p1 / (p2 * (10.0 ** (target_snr_db / 10.0))))
+
+    s2_m1 *= gain
+    s2_m2 *= gain
+
+    # 7) Mix
+    mix_m1 = s1_m1 + s2_m1
+    mix_m2 = s1_m2 + s2_m2
+
+    mix_stereo = np.stack([mix_m1, mix_m2], axis=1).astype(np.float32)
+    s1_stereo = np.stack([s1_m1, s1_m2], axis=1).astype(np.float32)
+    s2_stereo = np.stack([s2_m1, s2_m2], axis=1).astype(np.float32)
+
+    # 8) Normalize to avoid clipping
+    peak = float(np.max(np.abs(mix_stereo)) + 1e-12)
+    if peak > 0.99:
+        scale = 0.99 / peak
+        mix_stereo *= scale
+        s1_stereo *= scale
+        s2_stereo *= scale
+
+    meta = {
+        "sr": sr,
+        "room_dim": room_dim.tolist(),
+        "rt60": rt60,
+        "absorption": e_abs,
+        "mic1": mic1.tolist(),
+        "mic2": mic2.tolist(),
+        "src1": src1.tolist(),
+        "src2": src2.tolist(),
+        "mic_spacing": spacing,
+        "target_snr_db_at_mic1": target_snr_db,
+        "gain_applied_to_s2": float(gain),
+    }
+
+    return mix_stereo, s1_stereo, s2_stereo, meta
