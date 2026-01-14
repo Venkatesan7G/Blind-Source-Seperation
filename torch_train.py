@@ -7,13 +7,22 @@ from torch.utils.data import Dataset, DataLoader
 
 from torch_model import TFMaskUNet
 
-
 STFT_DIR = "stft_data"
 SPLIT_PATH = "splits/split.json"
 OUT_DIR = "checkpoints_torch"
 
+# ---- TUNABLES ----
+BASE = 64
+BATCH_SIZE = 4
+LR = 1e-3
+EPOCHS = 80
+PATIENCE = 12
 
-class BSSNpyDataset(Dataset):
+ALPHA_CONS = 0.2
+EPS = 1e-8
+
+
+class BSSMagDataset(Dataset):
     def __init__(self, ids, stft_dir=STFT_DIR):
         self.ids = ids
         self.feats_dir = os.path.join(stft_dir, "feats")
@@ -26,41 +35,69 @@ class BSSNpyDataset(Dataset):
         sid = self.ids[idx]
 
         feats = np.load(os.path.join(self.feats_dir, f"{sid}.npy")).astype(np.float32)  # (F,T,5)
-
         mags_path = os.path.join(self.mags_dir, f"{sid}.npz")
         if not os.path.exists(mags_path):
-            raise FileNotFoundError(
-                f"Missing {mags_path}. Re-run: python feature_extraction.py"
-            )
+            raise FileNotFoundError(f"Missing {mags_path}. Run: python feature_extraction.py")
         mz = np.load(mags_path)
-        mix_mag = mz["mix_mag"].astype(np.float32)  # (F,T) |X_mic1|
-        s1_mag = mz["s1_mag"].astype(np.float32)    # (F,T) |S1_mic1|
-        s2_mag = mz["s2_mag"].astype(np.float32)    # (F,T) |S2_mic1|
+        mix_mag = mz["mix_mag"].astype(np.float32)  # (F,T)
+        s1_mag = mz["s1_mag"].astype(np.float32)
+        s2_mag = mz["s2_mag"].astype(np.float32)
 
-        # to torch
         feats = torch.from_numpy(feats).permute(2, 0, 1)  # (5,F,T)
-        mix_mag = torch.from_numpy(mix_mag)               # (F,T)
-        s1_mag = torch.from_numpy(s1_mag)                 # (F,T)
-        s2_mag = torch.from_numpy(s2_mag)                 # (F,T)
+        mix_mag = torch.from_numpy(mix_mag)              # (F,T)
+        s1_mag = torch.from_numpy(s1_mag)
+        s2_mag = torch.from_numpy(s2_mag)
 
         return feats, mix_mag, s1_mag, s2_mag
 
 
-def mag_recon_loss(pred_masks, mix_mag, s1_mag, s2_mag):
+def _per_example_logmse(a, b, eps=EPS):
     """
-    pred_masks: (B,2,F,T) softmax masks
-    mix_mag:    (B,F,T)
-    s1_mag/s2_mag: (B,F,T)
+    a,b: (B,F,T)
+    returns: (B,)  mean over (F,T) per example
     """
-    m1 = pred_masks[:, 0, :, :]
-    m2 = pred_masks[:, 1, :, :]
+    da = torch.log1p(a + eps) - torch.log1p(b + eps)
+    return torch.mean(da * da, dim=(1, 2))
 
-    s1_hat = m1 * mix_mag
-    s2_hat = m2 * mix_mag
 
-    loss1 = torch.mean((s1_hat - s1_mag) ** 2)
-    loss2 = torch.mean((s2_hat - s2_mag) ** 2)
-    return loss1 + loss2
+def _per_example_mse(a, b):
+    """
+    a,b: (B,F,T)
+    returns: (B,)
+    """
+    d = a - b
+    return torch.mean(d * d, dim=(1, 2))
+
+
+def mag_loss(pred_masks, mix_mag, s1_mag, s2_mag, alpha_cons=ALPHA_CONS, eps=EPS):
+    """
+    Correct PIT loss: choose best permutation PER EXAMPLE (not one scalar for whole batch).
+    pred_masks: (B,2,F,T) softmax
+    mix_mag,s1_mag,s2_mag: (B,F,T)
+    """
+    m1 = pred_masks[:, 0]  # (B,F,T)
+    m2 = pred_masks[:, 1]
+
+    # assignment A
+    s1_hat_a = m1 * mix_mag
+    s2_hat_a = m2 * mix_mag
+    loss_a = _per_example_logmse(s1_hat_a, s1_mag, eps) + _per_example_logmse(s2_hat_a, s2_mag, eps)
+
+    # assignment B (swap)
+    s1_hat_b = m2 * mix_mag
+    s2_hat_b = m1 * mix_mag
+    loss_b = _per_example_logmse(s1_hat_b, s1_mag, eps) + _per_example_logmse(s2_hat_b, s2_mag, eps)
+
+    # pick best per example
+    use_b = (loss_b < loss_a).float()  # (B,)
+    loss = (1.0 - use_b) * loss_a + use_b * loss_b  # (B,)
+
+    # mixture consistency per example, matched to chosen permutation
+    cons_a = _per_example_mse(s1_hat_a + s2_hat_a, mix_mag)
+    cons_b = _per_example_mse(s1_hat_b + s2_hat_b, mix_mag)
+    cons = (1.0 - use_b) * cons_a + use_b * cons_b  # (B,)
+
+    return torch.mean(loss + alpha_cons * cons)
 
 
 def evaluate(model, loader, device):
@@ -75,7 +112,7 @@ def evaluate(model, loader, device):
             s2_mag = s2_mag.to(device, non_blocking=True)
 
             pred = model(feats)
-            loss = mag_recon_loss(pred, mix_mag, s1_mag, s2_mag)
+            loss = mag_loss(pred, mix_mag, s1_mag, s2_mag)
 
             total += float(loss.item()) * feats.size(0)
             n += feats.size(0)
@@ -84,9 +121,9 @@ def evaluate(model, loader, device):
 
 def gpu_mem(prefix=""):
     if torch.cuda.is_available():
-        allocated = torch.cuda.memory_allocated() / (1024**2)
-        reserved = torch.cuda.memory_reserved() / (1024**2)
-        print(f"{prefix}GPU mem: allocated={allocated:.1f}MB reserved={reserved:.1f}MB")
+        a = torch.cuda.memory_allocated() / (1024**2)
+        r = torch.cuda.memory_reserved() / (1024**2)
+        print(f"{prefix}GPU mem: allocated={a:.1f}MB reserved={r:.1f}MB")
 
 
 def main():
@@ -108,79 +145,52 @@ def main():
         gpu_mem("[startup] ")
 
     print("Loading datasets...")
-    train_ds = BSSNpyDataset(train_ids)
-    val_ds = BSSNpyDataset(val_ids)
-    print(f"Train samples: {len(train_ds)}  Val samples: {len(val_ds)}")
+    train_ds = BSSMagDataset(train_ids)
+    val_ds = BSSMagDataset(val_ids)
+    print(f"Train: {len(train_ds)}  Val: {len(val_ds)}")
 
-    # Infer shapes from one sample
+    # Alive check sample
     x0, mix0, s10, s20 = train_ds[0]
     in_ch = x0.shape[0]
-    print("Sample shapes feats:", tuple(x0.shape), "mix_mag:", tuple(mix0.shape))
+    print("Sample feats:", tuple(x0.shape), "mix_mag:", tuple(mix0.shape))
 
-    # ---- MODEL SIZE ----
-    base = 48
-    print(f"Building model (base={base}) ...")
-    model = TFMaskUNet(in_ch=in_ch, base=base, n_src=2).to(device)
+    print(f"Building model base={BASE} ...")
+    model = TFMaskUNet(in_ch=in_ch, base=BASE, n_src=2).to(device)
 
-    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
-
-    # AMP (safe)
+    opt = torch.optim.Adam(model.parameters(), lr=LR)
     scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
-    # ---- WINDOWS-SAFE LOADER (prevents hangs) ----
-    batch_size = 4  # start small; you can increase to 8 later if stable
-    print(f"Creating dataloaders (batch_size={batch_size}, num_workers=0) ...")
+    print(f"Creating dataloaders batch={BATCH_SIZE}, num_workers=0 ...")
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0,
+                              pin_memory=(device.type == "cuda"))
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0,
+                            pin_memory=(device.type == "cuda"))
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=0,  # IMPORTANT for Windows stability
-        pin_memory=(device.type == "cuda"),
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=(device.type == "cuda"),
-    )
-
-    # Alive check: load first batch
-    print("Loading first batch (alive check)...")
+    # Alive check first batch + forward
+    print("Alive check: loading first batch ...")
     feats, mix_mag, s1_mag, s2_mag = next(iter(train_loader))
-    print("First batch loaded.")
-    print("  feats:", tuple(feats.shape), "mix_mag:", tuple(mix_mag.shape))
-
+    print("Alive check: first batch loaded:", tuple(feats.shape))
     feats = feats.to(device)
     mix_mag = mix_mag.to(device)
     s1_mag = s1_mag.to(device)
     s2_mag = s2_mag.to(device)
-
     if device.type == "cuda":
-        gpu_mem("[before first forward] ")
-
-    # Alive check: one forward pass
-    print("Running first forward pass (alive check)...")
+        gpu_mem("[before forward] ")
     with torch.no_grad():
         with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
             pred = model(feats)
-            loss0 = mag_recon_loss(pred, mix_mag, s1_mag, s2_mag)
-    print("First forward OK. Loss:", float(loss0.item()))
+            l0 = mag_loss(pred, mix_mag, s1_mag, s2_mag)
+    print("Alive check: forward OK, loss=", float(l0.item()))
     if device.type == "cuda":
-        gpu_mem("[after first forward] ")
+        gpu_mem("[after forward] ")
 
-    # Training loop
     best_val = float("inf")
     best_path = os.path.join(OUT_DIR, "best.pt")
     final_path = os.path.join(OUT_DIR, "final.pt")
-
-    epochs = 60
-    patience = 10
     bad = 0
 
     print("Starting training...")
-    for epoch in range(1, epochs + 1):
+    for epoch in range(1, EPOCHS + 1):
         model.train()
         t0 = time.time()
         total = 0.0
@@ -196,7 +206,7 @@ def main():
 
             with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
                 pred = model(feats)
-                loss = mag_recon_loss(pred, mix_mag, s1_mag, s2_mag)
+                loss = mag_loss(pred, mix_mag, s1_mag, s2_mag)
 
             scaler.scale(loss).backward()
             scaler.step(opt)
@@ -209,26 +219,20 @@ def main():
         val_loss = evaluate(model, val_loader, device)
         dt = time.time() - t0
 
-        print(f"Epoch {epoch:02d}/{epochs} - {dt:.1f}s - train_loss {train_loss:.4f} - val_loss {val_loss:.4f}")
+        print(f"Epoch {epoch:03d}/{EPOCHS}  {dt:.1f}s  train={train_loss:.4f}  val={val_loss:.4f}")
 
         if val_loss < best_val - 1e-6:
             best_val = val_loss
             bad = 0
-            torch.save(
-                {"model_state": model.state_dict(), "in_ch": in_ch, "base": base},
-                best_path,
-            )
+            torch.save({"model_state": model.state_dict(), "in_ch": in_ch, "base": BASE}, best_path)
             print("  ✅ saved best:", best_path)
         else:
             bad += 1
-            if bad >= patience:
+            if bad >= PATIENCE:
                 print("Early stopping.")
                 break
 
-    torch.save(
-        {"model_state": model.state_dict(), "in_ch": in_ch, "base": base},
-        final_path,
-    )
+    torch.save({"model_state": model.state_dict(), "in_ch": in_ch, "base": BASE}, final_path)
     print("Saved final:", final_path)
 
 

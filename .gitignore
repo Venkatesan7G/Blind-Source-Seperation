@@ -8,3 +8,5 @@ checkpoints*
 checkpoints
 speech*
 __pycache__
+separated_beamform
+bench_out
