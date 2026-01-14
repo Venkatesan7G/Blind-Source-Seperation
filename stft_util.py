@@ -1,20 +1,17 @@
 import numpy as np
 import librosa
 
-# Keep these consistent with feature_extraction.py
+SR = 16000
 N_FFT = 512
 HOP = 128
 WIN_LENGTH = 512
 CENTER = True
 
 FULL_F = N_FFT // 2 + 1  # 257
+N_BINS = 256             # train on first 256 bins (drop Nyquist)
 
 
 def stft_1d(x: np.ndarray) -> np.ndarray:
-    """
-    x: (N,)
-    returns complex STFT: (F,T) where F=257 for n_fft=512
-    """
     return librosa.stft(
         x.astype(np.float32),
         n_fft=N_FFT,
@@ -24,28 +21,41 @@ def stft_1d(x: np.ndarray) -> np.ndarray:
     )
 
 
-def istft_1d(X: np.ndarray, length: int | None = None) -> np.ndarray:
+def stft_stereo(x: np.ndarray) -> np.ndarray:
     """
-    X: complex STFT (F,T).
-    If F==256 (cropped), pad back to 257 for librosa.istft with n_fft=512.
+    Accepts stereo waveform:
+      - (N,2)  from soundfile
+      - (2,N)
+    Returns:
+      - (2,F,T) complex
     """
-    if X.shape[0] == FULL_F - 1:  # 256
-        X = np.pad(X, ((0, 1), (0, 0)), mode="constant")  # -> (257,T)
+    if x.ndim != 2:
+        raise ValueError(f"Expected 2D stereo array, got {x.shape}")
 
-    return librosa.istft(
-        X,
-        hop_length=HOP,
-        win_length=WIN_LENGTH,
-        center=CENTER,
-        length=length,
-    ).astype(np.float32)
+    if x.shape[1] == 2:         # (N,2)
+        ch1 = x[:, 0]
+        ch2 = x[:, 1]
+    elif x.shape[0] == 2:       # (2,N)
+        ch1 = x[0, :]
+        ch2 = x[1, :]
+    else:
+        raise ValueError(f"Not stereo: {x.shape}")
+
+    X1 = stft_1d(ch1)
+    X2 = stft_1d(ch2)
+    return np.stack([X1, X2], axis=0)
+
+
+def crop_F(arr: np.ndarray, target_F: int = N_BINS) -> np.ndarray:
+    # supports (F,T) or (C,F,T)
+    if arr.ndim == 2:
+        return arr[:target_F, :]
+    if arr.ndim == 3:
+        return arr[:, :target_F, :]
+    raise ValueError(f"Unsupported shape for crop_F: {arr.shape}")
 
 
 def pad_or_trim_T(arr: np.ndarray, T: int) -> np.ndarray:
-    """
-    Pads or truncates along the LAST axis to exactly T frames.
-    Works for (..., T).
-    """
     curT = arr.shape[-1]
     if curT == T:
         return arr
@@ -56,23 +66,18 @@ def pad_or_trim_T(arr: np.ndarray, T: int) -> np.ndarray:
     return np.pad(arr, pad, mode="constant")
 
 
-def crop_F(arr: np.ndarray, target_F: int) -> np.ndarray:
+def istft_1d(X: np.ndarray, length: int | None = None) -> np.ndarray:
     """
-    Crop frequency axis to target_F (keep low frequencies).
-    Supports arrays shaped:
-      (F,T) or (C,F,T) or (F,T,C)
+    If X is cropped to 256 bins, pad back to 257 bins before ISTFT.
     """
-    if arr.ndim == 2:
-        return arr[:target_F, :]
-    if arr.ndim == 3:
-        # Could be (C,F,T) or (F,T,C)
-        if arr.shape[1] == FULL_F or arr.shape[1] > target_F:
-            # assume (C,F,T)
-            return arr[:, :target_F, :]
-        else:
-            # assume (F,T,C)
-            return arr[:target_F, :, :]
-    # fallback: just slice first axis
-    slicer = [slice(None)] * arr.ndim
-    slicer[0] = slice(0, target_F)
-    return arr[tuple(slicer)]
+    if X.shape[0] == N_BINS:
+        X = np.pad(X, ((0, 1), (0, 0)), mode="constant")
+
+    y = librosa.istft(
+        X,
+        hop_length=HOP,
+        win_length=WIN_LENGTH,
+        center=CENTER,
+        length=length,
+    )
+    return y.astype(np.float32)

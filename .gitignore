@@ -4,4 +4,7 @@ splits
 stft_data
 cheeckpoints
 *.wav
-
+checkpoints*
+checkpoints
+speech*
+__pycache__
