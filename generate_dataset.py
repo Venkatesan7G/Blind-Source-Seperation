@@ -62,7 +62,7 @@ def build_speaker_index(items):
 def main(
     speech_dir="speech_pool",
     out_dir="dataset",
-    num_mixes=2000,
+    num_mixes=3000,
     mix_seconds=4.0,
     snr_db_range=(-5.0, 5.0),
     seed=1234,
@@ -151,7 +151,7 @@ if __name__ == "__main__":
     main(
         speech_dir="speech_pool",
         out_dir="dataset",
-        num_mixes=2000,      # start 2000; later try 3000-5000
+        num_mixes=3000,      # start 2000; later try 3000-5000
         mix_seconds=4.0,
         snr_db_range=(-5.0, 5.0),
         seed=1234,

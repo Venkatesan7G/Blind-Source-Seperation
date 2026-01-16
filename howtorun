@@ -4,3 +4,6 @@ python split_data.py
 python torch_train.py
 python torch_separate.py
 python evaluation_bss.py
+
+
+The model was collapsing to the trivial solution M1=M2=0.5, giving artificially high SAR but zero SIR. I have identified and corrected the loss formulation by adding mask-discrimination and entropy regularization to prevent collapse. Retraining is now in progress and expected to push SIR into the 7–10 dB range while maintaining high SAR

@@ -6,25 +6,37 @@ from mir_eval.separation import bss_eval_sources
 
 DATASET_DIR = "dataset"
 SPLIT_PATH = "splits/split.json"
-SEP_DIR = "separated_beamform"   # change to "separated" for mask-only
+
+# Set this depending on what you want to evaluate:
+#   "separated" for mask-only
+#   "separated_beamform" for MVDR output
+SEP_DIR = "separated_beamform"
 
 EPS = 1e-12
+
 
 def load_ref_mic1(path):
     x, _ = sf.read(path, always_2d=True)
     return x[:, 0].astype(np.float32)
 
+
 def load_est_mono(path):
     x, _ = sf.read(path, always_2d=True)
-    # if mono saved, always_2d gives (N,1)
     return x[:, 0].astype(np.float32)
+
+
+def _normalize_for_bss(x: np.ndarray):
+    # remove DC
+    x = x - np.mean(x)
+    # avoid zero signal
+    e = np.sqrt(np.mean(x * x) + EPS)
+    return x / e
+
 
 def eval_pit(ref1, ref2, est1, est2):
     """
-    Evaluate both assignments:
-      A: (est1->ref1, est2->ref2)
-      B: (est2->ref1, est1->ref2)
-    Pick the one with higher mean SDR.
+    Evaluate both assignments (PIT) and pick the one with higher mean SDR.
+    Uses mir_eval bss_eval_sources.
     """
     L = min(len(ref1), len(ref2), len(est1), len(est2))
     ref = np.vstack([ref1[:L], ref2[:L]]).astype(np.float32)
@@ -39,19 +51,20 @@ def eval_pit(ref1, ref2, est1, est2):
         return sdr_b, sir_b, sar_b
     return sdr_a, sir_a, sar_a
 
+
 def main():
     print("Using SEP_DIR:", SEP_DIR)
+
     split = json.load(open(SPLIT_PATH, "r", encoding="utf-8"))
     test_ids = split["test"]
 
-    # quick existence check
     ex0 = test_ids[0]
     p = os.path.join(SEP_DIR, f"s1_hat_{ex0}.wav")
     print("Example est path:", p, "exists?", os.path.exists(p))
 
     SDRs, SIRs, SARs = [], [], []
-
     missing = 0
+
     for sid in test_ids:
         ref1 = load_ref_mic1(os.path.join(DATASET_DIR, "s1", f"s1_{sid}.wav"))
         ref2 = load_ref_mic1(os.path.join(DATASET_DIR, "s2", f"s2_{sid}.wav"))
@@ -65,7 +78,13 @@ def main():
         est1 = load_est_mono(e1_path)
         est2 = load_est_mono(e2_path)
 
-        sdr, sir, sar = eval_pit(ref1, ref2, est1, est2)
+        # beamforming can flip sign/scale: normalize both refs and ests
+        ref1n = _normalize_for_bss(ref1)
+        ref2n = _normalize_for_bss(ref2)
+        est1n = _normalize_for_bss(est1)
+        est2n = _normalize_for_bss(est2)
+
+        sdr, sir, sar = eval_pit(ref1n, ref2n, est1n, est2n)
         SDRs.append(sdr)
         SIRs.append(sir)
         SARs.append(sar)
@@ -84,10 +103,11 @@ def main():
     sir_m, sir_s = mean_std(SIRs)
     sar_m, sar_s = mean_std(SARs)
 
-    print("\n==== BSS Eval (mir_eval) on TEST set (mic1), PIT ====")
+    print("\n==== BSS Eval (mir_eval) on TEST set, PIT ====")
     print(f"SDR mean/std: {sdr_m:.2f} / {sdr_s:.2f} dB")
     print(f"SIR mean/std: {sir_m:.2f} / {sir_s:.2f} dB")
     print(f"SAR mean/std: {sar_m:.2f} / {sar_s:.2f} dB")
+
 
 if __name__ == "__main__":
     main()

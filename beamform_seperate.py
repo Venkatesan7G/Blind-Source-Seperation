@@ -19,7 +19,7 @@ META_DIR = os.path.join(STFT_DIR, "meta")
 SR = 16000
 EPS = 1e-8
 
-DIAG_LOAD = 1e-2   # stronger for stability
+DIAG_LOAD = 5e-2   # stronger for stability
 MASK_SHARPEN_P = 1.0  # try 1.0 first; later 0.7..1.5
 
 
@@ -124,6 +124,8 @@ def main():
             Z = M1 + M2 + 1e-8
             M1 /= Z
             M2 /= Z
+            M1 = np.clip(M1, 0.05, 0.95)
+            M2 = np.clip(M2, 0.05, 0.95)
 
         # Beamform each target using Mn = 1 - Mt
         Y1 = apply_mvdr_from_target_mask(X, M1)
