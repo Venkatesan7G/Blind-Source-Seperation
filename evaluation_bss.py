@@ -6,7 +6,10 @@ from mir_eval.separation import bss_eval_sources
 
 DATASET_DIR = "dataset"
 SPLIT_PATH = "splits/split.json"
-SEP_DIR = "separated_rd"   # or "separated", etc.
+
+# change this depending on what you evaluate:
+# "separated" (mask-only), "separated_beamform", "separated_rd"
+SEP_DIR = "separated_rd"
 
 EPS = 1e-12
 
@@ -21,13 +24,13 @@ def load_est_mono(path):
     return x[:, 0].astype(np.float32)
 
 
-def remove_dc(x):
+def dc_remove(x: np.ndarray):
     return (x - np.mean(x)).astype(np.float32)
 
 
-def eval_pit(ref1, ref2, est1, est2, pick_by="sir"):
+def eval_pit(ref1, ref2, est1, est2):
     """
-    PIT between two outputs. pick_by: "sir" (recommended) or "sdr"
+    Evaluate both assignments (PIT) and pick the one with higher mean SDR.
     """
     L = min(len(ref1), len(ref2), len(est1), len(est2))
     ref = np.vstack([ref1[:L], ref2[:L]]).astype(np.float32)
@@ -38,14 +41,7 @@ def eval_pit(ref1, ref2, est1, est2, pick_by="sir"):
     sdr_a, sir_a, sar_a, _ = bss_eval_sources(ref, est_a)
     sdr_b, sir_b, sar_b, _ = bss_eval_sources(ref, est_b)
 
-    if pick_by == "sir":
-        score_a = float(np.mean(sir_a))
-        score_b = float(np.mean(sir_b))
-    else:
-        score_a = float(np.mean(sdr_a))
-        score_b = float(np.mean(sdr_b))
-
-    if score_b > score_a:
+    if float(np.mean(sdr_b)) > float(np.mean(sdr_a)):
         return sdr_b, sir_b, sar_b
     return sdr_a, sir_a, sar_a
 
@@ -76,13 +72,13 @@ def main():
         est1 = load_est_mono(e1_path)
         est2 = load_est_mono(e2_path)
 
-        # Optional DC removal only
-        ref1 = remove_dc(ref1)
-        ref2 = remove_dc(ref2)
-        est1 = remove_dc(est1)
-        est2 = remove_dc(est2)
+        # optional DC removal only
+        ref1 = dc_remove(ref1)
+        ref2 = dc_remove(ref2)
+        est1 = dc_remove(est1)
+        est2 = dc_remove(est2)
 
-        sdr, sir, sar = eval_pit(ref1, ref2, est1, est2, pick_by="sir")
+        sdr, sir, sar = eval_pit(ref1, ref2, est1, est2)
         SDRs.append(sdr)
         SIRs.append(sir)
         SARs.append(sar)

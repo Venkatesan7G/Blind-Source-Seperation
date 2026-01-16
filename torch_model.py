@@ -1,91 +1,111 @@
+# torch_model.py
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
+EPS = 1e-8
 
 
-class ConvBlock(nn.Module):
-    def __init__(self, in_ch, out_ch):
+class UnfoldedComplexGivensDemixer(nn.Module):
+    """
+    2ch demixer via complex Givens (unitary) rotation per frequency:
+
+      y1 =  cosθ * x1 + e^{jφ} sinθ * x2
+      y2 = -e^{-jφ} sinθ * x1 + cosθ * x2
+
+    θ(f) controls "direction" mixing
+    φ(f) gives phase-aware rotation (KEY: fixes "no phase awareness")
+
+    Update θ,φ iteratively (deep unfolding) using cross-covariance signal.
+    Add explicit spatial constraint by smoothing update signals across frequency.
+    """
+
+    def __init__(self, F: int, K: int = 8, theta_lr: float = 0.15, phi_lr: float = 0.05, smooth_ks: int = 9):
         super().__init__()
-        self.c1 = nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1)
-        self.b1 = nn.BatchNorm2d(out_ch)
-        self.c2 = nn.Conv2d(out_ch, out_ch, kernel_size=3, padding=1)
-        self.b2 = nn.BatchNorm2d(out_ch)
+        self.F = F
+        self.K = K
 
-    def forward(self, x):
-        x = F.relu(self.b1(self.c1(x)))
-        x = F.relu(self.b2(self.c2(x)))
-        return x
+        # Learnable step sizes per iteration
+        self.alpha_theta = nn.Parameter(torch.ones(K) * float(theta_lr))
+        self.alpha_phi = nn.Parameter(torch.ones(K) * float(phi_lr))
 
+        # Learnable per-frequency gain on update
+        self.beta = nn.Parameter(torch.ones(F))
 
-class TFMaskUNet(nn.Module):
-    """
-    Input:  (B, 5, F, T)
-    Output: (B, 2, F, T) masks with softmax across source dim (sum=1 per TF-bin)
-    """
-    def __init__(self, in_ch=5, base=32, n_src=2):
-        super().__init__()
-        self.enc1 = ConvBlock(in_ch, base)
-        self.pool1 = nn.MaxPool2d(2)
+        # Explicit spatial constraint: smooth update signals along frequency
+        # (fixed low-pass initially; still learnable weights)
+        pad = smooth_ks // 2
+        self.smooth = nn.Conv1d(1, 1, kernel_size=smooth_ks, padding=pad, bias=False)
+        with torch.no_grad():
+            self.smooth.weight.fill_(1.0 / smooth_ks)
 
-        self.enc2 = ConvBlock(base, base * 2)
-        self.pool2 = nn.MaxPool2d(2)
+    @staticmethod
+    def _apply_rotation(x1, x2, theta, phi):
+        """
+        x1,x2: (B,F,T) complex
+        theta,phi: (B,F) float
+        returns y1,y2: (B,F,T) complex
+        """
+        ct = torch.cos(theta)[:, :, None]  # (B,F,1)
+        st = torch.sin(theta)[:, :, None]
+        ejphi = torch.exp(1j * phi)[:, :, None]  # complex (B,F,1)
 
-        self.bott = ConvBlock(base * 2, base * 4)
+        y1 = ct * x1 + ejphi * st * x2
+        y2 = -torch.conj(ejphi) * st * x1 + ct * x2
+        return y1, y2
 
-        self.up2 = nn.Upsample(scale_factor=2, mode="nearest")
-        self.dec2a = nn.Conv2d(base * 4, base * 2, kernel_size=2, padding=0)
-        self.dec2 = ConvBlock(base * 4, base * 2)
+    def forward(self, X: torch.Tensor):
+        """
+        X: (B,2,F,T) complex64/complex32
+        returns Y: (B,2,F,T) complex
+        """
+        B, C, F, T = X.shape
+        assert C == 2 and F == self.F, f"Expected X (B,2,{self.F},T), got {tuple(X.shape)}"
 
-        self.up1 = nn.Upsample(scale_factor=2, mode="nearest")
-        self.dec1a = nn.Conv2d(base * 2, base, kernel_size=2, padding=0)
-        self.dec1 = ConvBlock(base * 2, base)
+        x1 = X[:, 0]  # (B,F,T)
+        x2 = X[:, 1]
 
-        self.out = nn.Conv2d(base, n_src, kernel_size=1)
+        theta = torch.zeros((B, F), device=X.device, dtype=torch.float32)
+        phi = torch.zeros((B, F), device=X.device, dtype=torch.float32)
 
-    def forward(self, x):
-        # x: (B,5,F,T)
-        c1 = self.enc1(x)          # (B,base,F,T)
-        p1 = self.pool1(c1)        # (B,base,F/2,T/2)
+        for k in range(self.K):
+            y1, y2 = self._apply_rotation(x1, x2, theta, phi)
 
-        c2 = self.enc2(p1)         # (B,2base,F/2,T/2)
-        p2 = self.pool2(c2)        # (B,2base,F/4,T/4)
+            # Cross-covariance per frequency: sum_t y1 * conj(y2)
+            cross = torch.sum(y1 * torch.conj(y2), dim=-1)  # (B,F) complex
 
-        b = self.bott(p2)          # (B,4base,F/4,T/4)
+            # Total power (stabilizer)
+            pwr = torch.sum((y1.real**2 + y1.imag**2) + (y2.real**2 + y2.imag**2), dim=-1) + EPS  # (B,F)
 
-        u2 = self.up2(b)           # (B,4base,F/2,T/2)
-        u2 = F.relu(self.dec2a(u2))# (B,2base,?,?)
-        # pad/crop to match skip
-        u2 = _match(u2, c2)
-        d2 = self.dec2(torch.cat([u2, c2], dim=1))
+            # Update signals:
+            # - imag(cross) drives "direction" decorrelation (classic)
+            # - real(cross) drives phase alignment (adds phase awareness)
+            g_theta = (cross.imag / pwr).float()  # (B,F)
+            g_phi = (cross.real / pwr).float()    # (B,F)
 
-        u1 = self.up1(d2)          # (B,2base,F,T)
-        u1 = F.relu(self.dec1a(u1))# (B,base,?,?)
-        u1 = _match(u1, c1)
-        d1 = self.dec1(torch.cat([u1, c1], dim=1))
+            # Explicit spatial smoothness across frequency
+            g_theta = self.smooth(g_theta[:, None, :]).squeeze(1)  # (B,F)
+            g_phi = self.smooth(g_phi[:, None, :]).squeeze(1)
 
-        logits = self.out(d1)      # (B,2,F,T)
-        masks = F.softmax(logits, dim=1)  # sum-to-1 across sources
-        return masks
+            # Per-frequency learned scaling
+            g_theta = g_theta * self.beta[None, :]
+            g_phi = g_phi * self.beta[None, :]
 
+            # Unfolded updates
+            theta = theta - self.alpha_theta[k] * g_theta
+            phi = phi - self.alpha_phi[k] * g_phi
 
-def _match(x, ref):
-    """
-    Make x spatial dims match ref by center crop or pad.
-    """
-    _, _, hx, wx = x.shape
-    _, _, hr, wr = ref.shape
-    # crop
-    if hx > hr:
-        dh = (hx - hr) // 2
-        x = x[:, :, dh:dh + hr, :]
-    if wx > wr:
-        dw = (wx - wr) // 2
-        x = x[:, :, :, dw:dw + wr]
-    # pad
-    if x.shape[2] < hr:
-        pad = hr - x.shape[2]
-        x = F.pad(x, (0, 0, pad // 2, pad - pad // 2))
-    if x.shape[3] < wr:
-        pad = wr - x.shape[3]
-        x = F.pad(x, (pad // 2, pad - pad // 2, 0, 0))
-    return x
+            # Keep phi bounded (avoid wild phase)
+            phi = torch.remainder(phi + torch.pi, 2 * torch.pi) - torch.pi
+
+        y1, y2 = self._apply_rotation(x1, x2, theta, phi)
+        Y = torch.stack([y1, y2], dim=1)  # (B,2,F,T)
+        return Y
+
+    def unitary_penalty(self):
+        """
+        For this parameterization, the 2x2 matrix is unitary by construction,
+        but numeric drift / training can still cause mild instability.
+        Small regularizer helps keep updates stable.
+        """
+        # Penalize large step sizes (stability)
+        return 1e-4 * (torch.mean(self.alpha_theta**2) + torch.mean(self.alpha_phi**2))

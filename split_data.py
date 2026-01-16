@@ -2,33 +2,21 @@ import os
 import json
 import random
 
-DATASET_DIR = "dataset"
-OUT_DIR = "splits"
+def main(stft_dir="stft_data", out_dir="splits", seed=1234):
+    x_dir = os.path.join(stft_dir, "X")
+    if not os.path.exists(x_dir):
+        raise FileNotFoundError(f"Missing folder: {x_dir}. Run feature_extraction.py first.")
 
-def main(dataset_dir=DATASET_DIR, out_dir=OUT_DIR, seed=1234, train_p=0.70, val_p=0.15):
-    mix_dir = os.path.join(dataset_dir, "mix")
-    if not os.path.exists(mix_dir):
-        raise FileNotFoundError(f"Missing {mix_dir}. Generate dataset first.")
-
-    # ids from mix_XXXXX.wav
-    ids = []
-    for f in os.listdir(mix_dir):
-        if f.startswith("mix_") and f.endswith(".wav"):
-            sid = f[len("mix_"):-len(".wav")]
-            if len(sid) == 5 and sid.isdigit():
-                ids.append(sid)
-
-    ids = sorted(ids)
+    ids = sorted([f.replace(".npy", "") for f in os.listdir(x_dir) if f.endswith(".npy")])
     if not ids:
-        raise RuntimeError(f"No mixture wavs found in {mix_dir}")
+        raise RuntimeError("No X files found. Run feature_extraction.py first.")
 
     random.seed(seed)
     random.shuffle(ids)
 
     n = len(ids)
-    n_train = int(train_p * n)
-    n_val = int(val_p * n)
-    n_test = n - n_train - n_val
+    n_train = int(0.70 * n)
+    n_val = int(0.15 * n)
 
     split = {
         "train": ids[:n_train],

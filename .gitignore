@@ -11,3 +11,5 @@ __pycache__
 separated_beamform
 separated_rd
 bench_out
+oldcheckpoints_rd
+oldcheckpoints
