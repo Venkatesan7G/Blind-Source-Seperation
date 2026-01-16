@@ -6,11 +6,7 @@ from mir_eval.separation import bss_eval_sources
 
 DATASET_DIR = "dataset"
 SPLIT_PATH = "splits/split.json"
-
-# Set this depending on what you want to evaluate:
-#   "separated" for mask-only
-#   "separated_beamform" for MVDR output
-SEP_DIR = "separated_beamform"
+SEP_DIR = "separated_rd"   # or "separated", etc.
 
 EPS = 1e-12
 
@@ -25,18 +21,13 @@ def load_est_mono(path):
     return x[:, 0].astype(np.float32)
 
 
-def _normalize_for_bss(x: np.ndarray):
-    # remove DC
-    x = x - np.mean(x)
-    # avoid zero signal
-    e = np.sqrt(np.mean(x * x) + EPS)
-    return x / e
+def remove_dc(x):
+    return (x - np.mean(x)).astype(np.float32)
 
 
-def eval_pit(ref1, ref2, est1, est2):
+def eval_pit(ref1, ref2, est1, est2, pick_by="sir"):
     """
-    Evaluate both assignments (PIT) and pick the one with higher mean SDR.
-    Uses mir_eval bss_eval_sources.
+    PIT between two outputs. pick_by: "sir" (recommended) or "sdr"
     """
     L = min(len(ref1), len(ref2), len(est1), len(est2))
     ref = np.vstack([ref1[:L], ref2[:L]]).astype(np.float32)
@@ -47,7 +38,14 @@ def eval_pit(ref1, ref2, est1, est2):
     sdr_a, sir_a, sar_a, _ = bss_eval_sources(ref, est_a)
     sdr_b, sir_b, sar_b, _ = bss_eval_sources(ref, est_b)
 
-    if float(np.mean(sdr_b)) > float(np.mean(sdr_a)):
+    if pick_by == "sir":
+        score_a = float(np.mean(sir_a))
+        score_b = float(np.mean(sir_b))
+    else:
+        score_a = float(np.mean(sdr_a))
+        score_b = float(np.mean(sdr_b))
+
+    if score_b > score_a:
         return sdr_b, sir_b, sar_b
     return sdr_a, sir_a, sar_a
 
@@ -78,13 +76,13 @@ def main():
         est1 = load_est_mono(e1_path)
         est2 = load_est_mono(e2_path)
 
-        # beamforming can flip sign/scale: normalize both refs and ests
-        ref1n = _normalize_for_bss(ref1)
-        ref2n = _normalize_for_bss(ref2)
-        est1n = _normalize_for_bss(est1)
-        est2n = _normalize_for_bss(est2)
+        # Optional DC removal only
+        ref1 = remove_dc(ref1)
+        ref2 = remove_dc(ref2)
+        est1 = remove_dc(est1)
+        est2 = remove_dc(est2)
 
-        sdr, sir, sar = eval_pit(ref1n, ref2n, est1n, est2n)
+        sdr, sir, sar = eval_pit(ref1, ref2, est1, est2, pick_by="sir")
         SDRs.append(sdr)
         SIRs.append(sir)
         SARs.append(sar)
@@ -92,7 +90,7 @@ def main():
     if missing > 0:
         print(f"WARNING: missing estimate pairs for {missing} items")
 
-    SDRs = np.array(SDRs)  # (N,2)
+    SDRs = np.array(SDRs)
     SIRs = np.array(SIRs)
     SARs = np.array(SARs)
 

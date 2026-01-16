@@ -9,4 +9,5 @@ checkpoints
 speech*
 __pycache__
 separated_beamform
+separated_rd
 bench_out
