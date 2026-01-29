@@ -11,7 +11,7 @@ STFT_DIR = "stft_data"
 SPLIT_PATH = "splits/split.json"
 
 # Use best.pt for evaluation unless you explicitly want final.pt
-CKPT_PATH = "checkpoints_rd/best.pt"
+CKPT_PATH = "checkpoints_fixed/best.pt"
 
 OUT_DIR = "separated_rd"
 META_DIR = os.path.join(STFT_DIR, "meta")

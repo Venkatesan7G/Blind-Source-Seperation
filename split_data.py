@@ -2,14 +2,23 @@ import os
 import json
 import random
 
-def main(stft_dir="stft_data", out_dir="splits", seed=1234):
-    x_dir = os.path.join(stft_dir, "X")
-    if not os.path.exists(x_dir):
-        raise FileNotFoundError(f"Missing folder: {x_dir}. Run feature_extraction.py first.")
+DATASET_DIR = "dataset"
+OUT_DIR = "splits"
 
-    ids = sorted([f.replace(".npy", "") for f in os.listdir(x_dir) if f.endswith(".npy")])
+def main(dataset_dir=DATASET_DIR, out_dir=OUT_DIR, seed=1234):
+    mix_dir = os.path.join(dataset_dir, "mix")
+    if not os.path.isdir(mix_dir):
+        raise FileNotFoundError(f"Missing folder: {mix_dir}")
+
+    ids = []
+    for fn in os.listdir(mix_dir):
+        if fn.startswith("mix_") and fn.endswith(".wav"):
+            sid = fn[len("mix_"):-len(".wav")]
+            ids.append(sid)
+
+    ids = sorted(ids)
     if not ids:
-        raise RuntimeError("No X files found. Run feature_extraction.py first.")
+        raise RuntimeError(f"No mix files found in {mix_dir}")
 
     random.seed(seed)
     random.shuffle(ids)
